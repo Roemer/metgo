@@ -2,7 +2,7 @@ package metgo
 
 import "time"
 
-type cacheMetaData struct {
+type cacheInfo struct {
 	Expires      time.Time `json:"expires"`
 	LastModified time.Time `json:"lastModified"`
 }
