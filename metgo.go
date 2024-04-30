@@ -220,7 +220,12 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 	req.Header.Set("User-Agent", service.siteName)
 	// Add last modified if we hve the info and cached data
 	if !lastCacheInfo.LastModified.IsZero() && lastCachedData != nil {
-		req.Header.Set("If-Modified-Since", lastCacheInfo.LastModified.UTC().Format(time.RFC1123))
+		gmtTimeLoc := time.FixedZone("GMT", 0)
+		ifModifiedDate := lastCacheInfo.LastModified.In(gmtTimeLoc).Format(time.RFC1123)
+		req.Header.Set("If-Modified-Since", ifModifiedDate)
+		if service.debug {
+			fmt.Printf("Adding If-Modified-Since header: %s\n", ifModifiedDate)
+		}
 	}
 
 	// Execute the request
