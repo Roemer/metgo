@@ -37,6 +37,13 @@ func (s *MetNoService) EnableDebug() {
 
 // Get a locationforecast result.
 func (s *MetNoService) Locationforecast(lat float64, lon float64, alt int) (*LocationforecastResult, error) {
+	// New Approach:
+	// Load data from memory
+	// Load data from cache
+	// Keep the newer data of any of those.
+	// If the data is not expired, return it
+	// If the data is expired, get new data from the api but add if-modified-since
+
 	// Check if there are data in-memory which should be reused
 	if cacheObject := validateMemoryCache(s, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo); cacheObject != nil {
 		// The data object is valid, return it
