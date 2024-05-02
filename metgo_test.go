@@ -23,7 +23,7 @@ func TestMetNoCache(t *testing.T) {
 	// Enable debug messages
 	service.EnableDebug()
 
-	// Get a location
+	// Get a location (should be from api)
 	locationforecastResult, err := service.Locationforecast(59.942787176440405, 10.720651536344942, 100)
 	assert.NoError(err)
 	assert.NotNil(locationforecastResult)

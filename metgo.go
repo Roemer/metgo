@@ -37,37 +37,22 @@ func (s *MetNoService) EnableDebug() {
 
 // Get a locationforecast result.
 func (s *MetNoService) Locationforecast(lat float64, lon float64, alt int) (*LocationforecastResult, error) {
-	// New Approach:
-	// Load data from memory
-	// Load data from cache
-	// Keep the newer data of any of those.
-	// If the data is not expired, return it
-	// If the data is expired, get new data from the api but add if-modified-since
-
-	// Check if there are data in-memory which should be reused
-	if cacheObject := validateMemoryCache(s, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo); cacheObject != nil {
-		// The data object is valid, return it
-		return cacheObject, nil
-	}
-
-	// Check if there are data in the disk cache that should be reused
-	cacheFileName := fmt.Sprintf("metno-locationforecast-%.4f-%.4f-%d.json", lat, lon, alt)
-	cacheInfoFileName := fmt.Sprintf("metno-locationforecast-%.4f-%.4f-%d-info.json", lat, lon, alt)
-	cacheObject, cacheInfoObject, err := validateDiskCache[LocationforecastResult](s, cacheFileName, cacheInfoFileName)
+	cacheName := fmt.Sprintf("locationforecast-%.4f-%.4f-%d", lat, lon, alt)
+	cacheObject, err := prepareDataFromCache[LocationforecastResult](s, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo, cacheName,
+		func(diskCacheObject *LocationforecastResult, diskCacheInfoObject cacheInfo) {
+			s.lastLocationforecastResult = diskCacheObject
+			s.lastLocationforecastCacheInfo = diskCacheInfoObject
+		})
 	if err != nil {
 		return nil, err
 	}
 	if cacheObject != nil {
-		// Valid cache data, make sure the disk cache data is stored in memory
-		s.lastLocationforecastResult = cacheObject
-		s.lastLocationforecastCacheInfo = cacheInfoObject
-		// Return the object
 		return cacheObject, nil
 	}
 
 	// No data somewhere else, so get the data from the api
 	url := fmt.Sprintf("https://api.met.no/weatherapi/locationforecast/2.0/complete?lat=%.4f&lon=%.4f&altitude=%d", lat, lon, alt)
-	cacheObject, cacheInfoObject, err = loadDataFromApi(s, url, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo)
+	apiCacheObject, apiCacheInfoObject, err := loadDataFromApi(s, url, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -75,17 +60,18 @@ func (s *MetNoService) Locationforecast(lat float64, lon float64, alt int) (*Loc
 		fmt.Println("Loaded from api")
 	}
 	// Update the memory cache
-	s.lastLocationforecastResult = cacheObject
-	s.lastLocationforecastCacheInfo = cacheInfoObject
+	s.lastLocationforecastResult = apiCacheObject
+	s.lastLocationforecastCacheInfo = apiCacheInfoObject
 	// Update the disk cache
-	if err := s.updateDiskCache(cacheObject, cacheFileName, cacheInfoObject, cacheInfoFileName); err != nil {
+	if err := s.updateDiskCache(apiCacheObject, apiCacheInfoObject, cacheName); err != nil {
 		return nil, fmt.Errorf("failed updating the data in the cache: %w", err)
 	}
 
-	return cacheObject, nil
+	return apiCacheObject, nil
 }
 
-func (s *MetNoService) updateDiskCache(cacheObject interface{}, cacheFileName string, cacheInfoObject cacheInfo, cacheInfoFileName string) error {
+func (s *MetNoService) updateDiskCache(cacheObject interface{}, cacheInfoObject cacheInfo, cacheName string) error {
+	cacheFileName, cacheInfoFileName := getCacheFileNames(cacheName)
 	// Cache result in disk cache
 	if err := s.saveResult(cacheObject, cacheFileName); err != nil {
 		return err
@@ -138,49 +124,47 @@ func isExpired(checkDate time.Time) bool {
 	return time.Now().After(checkDate)
 }
 
-func validateMemoryCache[T interface{}](service *MetNoService, cacheObject *T, cacheInfoObject cacheInfo) *T {
-	if cacheObject == nil {
-		if service.debug {
-			fmt.Println("No data in memory cache")
-		}
-		return nil
+// Loads and prepares the data from disk-cache.
+func prepareDataFromCache[T interface{}](service *MetNoService, memCacheObject *T, memCacheInfoObject cacheInfo, cacheName string, setMemCacheFunc func(*T, cacheInfo)) (*T, error) {
+	// Check the memory cache and if it is not expired, return it directly
+	if memCacheObject != nil && !isExpired(memCacheInfoObject.Expires) {
+		fmt.Println("Use memory cache as it is not expired")
+		return memCacheObject, nil
 	}
-	if isExpired(cacheInfoObject.Expires) {
-		if service.debug {
-			fmt.Println("Memory cache expired")
-		}
-		return nil
+
+	// Load data from disk cache
+	cacheFileName, cacheInfoFileName := getCacheFileNames(cacheName)
+	diskCacheObject, diskCacheInfoObject, err := loadDataFromCache[T](service.cacheDir, cacheFileName, cacheInfoFileName)
+	if err != nil {
+		return nil, err
 	}
-	if service.debug {
-		fmt.Println("Loaded from memory")
+	// No disk cache, fast return
+	if diskCacheObject == nil {
+		fmt.Println("No data in disk cache")
+		return nil, nil
 	}
-	return cacheObject
+
+	// if the disk cache is newer than the memory cache or the memory cache is empty, update the memory cache with it
+	if memCacheObject == nil || diskCacheInfoObject.LastModified.After(memCacheInfoObject.LastModified) {
+		fmt.Println("Updated memory cache with disk cache")
+		setMemCacheFunc(diskCacheObject, diskCacheInfoObject)
+	}
+
+	// Check the disk cache and if it is not expired, return it directly
+	if !isExpired(diskCacheInfoObject.Expires) {
+		fmt.Println("Use disk cache as it is not expired")
+		return diskCacheObject, nil
+	}
+
+	// All caches are not set or expired
+	fmt.Println("Caches are not set or expired")
+	return nil, nil
 }
 
-func validateDiskCache[T interface{}](service *MetNoService, cacheFileName string, cacheInfoFileName string) (*T, cacheInfo, error) {
-	cacheObject, cacheInfoObject, err := loadDataFromCache[T](service.cacheDir, cacheFileName, cacheInfoFileName)
-	if err != nil {
-		return nil, cacheInfo{}, err
-	}
-	if cacheObject == nil {
-		// No cached data
-		if service.debug {
-			fmt.Println("No data in disk cache")
-		}
-		return nil, cacheInfo{}, nil
-	}
-	if service.debug {
-		fmt.Println("Found data in disk cache")
-	}
-	// Check if the data from the disk cache expired
-	if isExpired(cacheInfoObject.Expires) {
-		if service.debug {
-			fmt.Println("Disk cache expired")
-		}
-		return nil, cacheInfo{}, nil
-	}
-	// Valid disk data
-	return cacheObject, cacheInfoObject, nil
+func getCacheFileNames(cacheName string) (string, string) {
+	cacheFileName := fmt.Sprintf("metno-%s.json", cacheName)
+	cacheInfoFileName := fmt.Sprintf("metno-%s-info.json", cacheName)
+	return cacheFileName, cacheInfoFileName
 }
 
 func loadDataFromCache[T interface{}](cacheDir, cacheFileName, cacheInfoFileName string) (*T, cacheInfo, error) {
