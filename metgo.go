@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,23 +17,22 @@ type MetNoService struct {
 	cacheDir                      string
 	lastLocationforecastResult    *LocationforecastResult
 	lastLocationforecastCacheInfo cacheInfo
-	debug                         bool
+	logger                        *slog.Logger
 }
 
 // Method to create a new service to ineract with the met.no api.
-func NewMetNoService(siteName string, cacheDirectory string) (*MetNoService, error) {
+func NewMetNoService(siteName string, cacheDirectory string, logger *slog.Logger) (*MetNoService, error) {
 	if siteName == "" {
 		return nil, fmt.Errorf("siteName must be defined")
+	}
+	if logger == nil {
+		logger = slog.New(discardHandler{})
 	}
 	return &MetNoService{
 		siteName: siteName,
 		cacheDir: cacheDirectory,
-		debug:    false,
+		logger:   logger,
 	}, nil
-}
-
-func (s *MetNoService) EnableDebug() {
-	s.debug = true
 }
 
 // Get a locationforecast result.
@@ -56,9 +56,8 @@ func (s *MetNoService) Locationforecast(lat float64, lon float64, alt int) (*Loc
 	if err != nil {
 		return nil, err
 	}
-	if s.debug {
-		fmt.Println("Loaded from api")
-	}
+	s.logger.Debug("Loaded from api")
+
 	// Update the memory cache
 	s.lastLocationforecastResult = apiCacheObject
 	s.lastLocationforecastCacheInfo = apiCacheInfoObject
@@ -128,7 +127,7 @@ func isExpired(checkDate time.Time) bool {
 func prepareDataFromCache[T interface{}](service *MetNoService, memCacheObject *T, memCacheInfoObject cacheInfo, cacheName string, setMemCacheFunc func(*T, cacheInfo)) (*T, error) {
 	// Check the memory cache and if it is not expired, return it directly
 	if memCacheObject != nil && !isExpired(memCacheInfoObject.Expires) {
-		fmt.Println("Use memory cache as it is not expired")
+		service.logger.Debug("Use memory cache as it is not expired")
 		return memCacheObject, nil
 	}
 
@@ -140,24 +139,24 @@ func prepareDataFromCache[T interface{}](service *MetNoService, memCacheObject *
 	}
 	// No disk cache, fast return
 	if diskCacheObject == nil {
-		fmt.Println("No data in disk cache")
+		service.logger.Debug("No data in disk cache")
 		return nil, nil
 	}
 
 	// if the disk cache is newer than the memory cache or the memory cache is empty, update the memory cache with it
 	if memCacheObject == nil || diskCacheInfoObject.LastModified.After(memCacheInfoObject.LastModified) {
-		fmt.Println("Updated memory cache with disk cache")
+		service.logger.Debug("Updated memory cache with disk cache")
 		setMemCacheFunc(diskCacheObject, diskCacheInfoObject)
 	}
 
 	// Check the disk cache and if it is not expired, return it directly
 	if !isExpired(diskCacheInfoObject.Expires) {
-		fmt.Println("Use disk cache as it is not expired")
+		service.logger.Debug("Use disk cache as it is not expired")
 		return diskCacheObject, nil
 	}
 
 	// All caches are not set or expired
-	fmt.Println("Caches are not set or expired")
+	service.logger.Debug("Caches are not set or expired")
 	return nil, nil
 }
 
@@ -200,9 +199,7 @@ func loadDataFromCache[T interface{}](cacheDir, cacheFileName, cacheInfoFileName
 }
 
 func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCachedData *T, lastCacheInfo cacheInfo) (*T, cacheInfo, error) {
-	if service.debug {
-		fmt.Printf("Loading data from api url: %s\n", url)
-	}
+	service.logger.Debug(fmt.Sprintf("Loading data from api url: %s", url))
 	// Create the request
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
@@ -214,9 +211,7 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 		gmtTimeLoc := time.FixedZone("GMT", 0)
 		ifModifiedDate := lastCacheInfo.LastModified.In(gmtTimeLoc).Format(time.RFC1123)
 		req.Header.Set("If-Modified-Since", ifModifiedDate)
-		if service.debug {
-			fmt.Printf("Adding If-Modified-Since header: %s\n", ifModifiedDate)
-		}
+		service.logger.Debug(fmt.Sprintf("Adding If-Modified-Since header: %s", ifModifiedDate))
 	}
 
 	// Execute the request
@@ -246,9 +241,7 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 
 	// Check if the response was 304 - Not Modified
 	if resp.StatusCode == 304 {
-		if service.debug {
-			fmt.Println("data from api not modified")
-		}
+		service.logger.Debug("data from api not modified")
 		// Return the last data but update the cache info
 		return lastCachedData, cacheInfo{Expires: expiresDate.Local(), LastModified: lastModifiedDate.Local()}, nil
 	}

@@ -1,6 +1,7 @@
 package metgo
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -17,11 +18,10 @@ func TestMetNoCache(t *testing.T) {
 	assert.NoError(err)
 
 	// Initialize the service
-	service, err := NewMetNoService("https://github.com/Roemer/metgo", cacheDirectory)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	service, err := NewMetNoService("https://github.com/Roemer/metgo", cacheDirectory, logger)
 	assert.NoError(err)
 	assert.NotNil(service)
-	// Enable debug messages
-	service.EnableDebug()
 
 	// Get a location (should be from api)
 	locationforecastResult, err := service.Locationforecast(59.942787176440405, 10.720651536344942, 100)
