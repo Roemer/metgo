@@ -1,4 +1,4 @@
-module metgo
+module github.com/roemer/metgo
 
 go 1.22.2
 
