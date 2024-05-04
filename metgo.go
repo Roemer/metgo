@@ -3,24 +3,20 @@ package metgo
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 )
 
 type MetNoService struct {
-	siteName                      string
-	cacheDir                      string
-	lastLocationforecastResult    *LocationforecastResult
-	lastLocationforecastCacheInfo cacheInfo
-	logger                        *slog.Logger
+	siteName               string
+	cacheDir               string
+	logger                 *slog.Logger
+	locationForecastCaches []Cache[LocationforecastResult]
 }
 
-// Method to create a new service to ineract with the met.no api.
+// Method to create a new service to interact with the met.no api.
 func NewMetNoService(siteName string, cacheDirectory string, logger *slog.Logger) (*MetNoService, error) {
 	if siteName == "" {
 		return nil, fmt.Errorf("siteName must be defined")
@@ -28,91 +24,56 @@ func NewMetNoService(siteName string, cacheDirectory string, logger *slog.Logger
 	if logger == nil {
 		logger = slog.New(discardHandler{})
 	}
-	return &MetNoService{
+	service := &MetNoService{
 		siteName: siteName,
 		cacheDir: cacheDirectory,
 		logger:   logger,
-	}, nil
+		// Caches should be ordered from most to least volatile (or performant)
+		locationForecastCaches: []Cache[LocationforecastResult]{
+			&MemoryCache[LocationforecastResult]{},
+			&DiskCache[LocationforecastResult]{CacheDirectory: cacheDirectory},
+		},
+	}
+	return service, nil
 }
 
 // Get a locationforecast result.
 func (s *MetNoService) Locationforecast(lat float64, lon float64, alt int) (*LocationforecastResult, error) {
-	cacheName := fmt.Sprintf("locationforecast-%.4f-%.4f-%d", lat, lon, alt)
-	cacheObject, err := prepareDataFromCache[LocationforecastResult](s, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo, cacheName,
-		func(diskCacheObject *LocationforecastResult, diskCacheInfoObject cacheInfo) {
-			s.lastLocationforecastResult = diskCacheObject
-			s.lastLocationforecastCacheInfo = diskCacheInfoObject
-		})
+	// Prepare the cache name
+	cacheName := s.buildLocationforecastCacheName(lat, lon, alt)
+
+	// Try get the data from one of the caches
+	cacheObject, cacheInfo, err := getDataFromCaches(s, s.locationForecastCaches, cacheName)
 	if err != nil {
 		return nil, err
 	}
-	if cacheObject != nil {
+	// If we have a cache object which is not expired, return it
+	if cacheObject != nil && !isExpired(cacheInfo.Expires) {
+		s.logger.Debug("Found valid data in cache")
 		return cacheObject, nil
 	}
 
 	// No data somewhere else, so get the data from the api
 	url := fmt.Sprintf("https://api.met.no/weatherapi/locationforecast/2.0/complete?lat=%.4f&lon=%.4f&altitude=%d", lat, lon, alt)
-	apiCacheObject, apiCacheInfoObject, err := loadDataFromApi(s, url, s.lastLocationforecastResult, s.lastLocationforecastCacheInfo)
+	apiCacheObject, apiCacheInfoObject, err := loadDataFromApi(s, url, cacheObject, cacheInfo)
 	if err != nil {
 		return nil, err
 	}
 	s.logger.Debug("Loaded from api")
 
-	// Update the memory cache
-	s.lastLocationforecastResult = apiCacheObject
-	s.lastLocationforecastCacheInfo = apiCacheInfoObject
-	// Update the disk cache
-	if err := s.updateDiskCache(apiCacheObject, apiCacheInfoObject, cacheName); err != nil {
-		return nil, fmt.Errorf("failed updating the data in the cache: %w", err)
+	// Update the caches
+	for _, cache := range s.locationForecastCaches {
+		if err := cache.SetCache(cacheName, apiCacheObject, apiCacheInfoObject); err != nil {
+			return nil, err
+		}
 	}
 
+	// Return the objec
 	return apiCacheObject, nil
 }
 
-func (s *MetNoService) updateDiskCache(cacheObject interface{}, cacheInfoObject cacheInfo, cacheName string) error {
-	cacheFileName, cacheInfoFileName := getCacheFileNames(cacheName)
-	// Cache result in disk cache
-	if err := s.saveResult(cacheObject, cacheFileName); err != nil {
-		return err
-	}
-	// Cache info in disk cache
-	if err := s.saveCacheInfo(cacheInfoObject, cacheInfoFileName); err != nil {
-		return err
-	}
-	// All good
-	return nil
-}
-
-func (s *MetNoService) saveResult(cacheObject interface{}, cacheFileName string) error {
-	// No disk cache provided, return without saving
-	if s.cacheDir == "" {
-		return nil
-	}
-	cacheFilePath := filepath.Join(s.cacheDir, cacheFileName)
-	cacheString, err := json.MarshalIndent(cacheObject, "", " ")
-	if err != nil {
-		return fmt.Errorf("failed converting the data object to a string")
-	}
-	if err := os.WriteFile(cacheFilePath, cacheString, os.ModePerm); err != nil {
-		return fmt.Errorf("failed storing the cache file: %w", err)
-	}
-	return nil
-}
-
-func (s *MetNoService) saveCacheInfo(cacheInfoObject cacheInfo, cacheInfoFileName string) error {
-	// No disk cache provided, return without saving
-	if s.cacheDir == "" {
-		return nil
-	}
-	cacheInfoFilePath := filepath.Join(s.cacheDir, cacheInfoFileName)
-	cacheInfoString, err := json.MarshalIndent(cacheInfoObject, "", " ")
-	if err != nil {
-		return fmt.Errorf("failed converting the info data object to a string")
-	}
-	if err := os.WriteFile(cacheInfoFilePath, cacheInfoString, os.ModePerm); err != nil {
-		return fmt.Errorf("failed storing the info data file: %w", err)
-	}
-	return nil
+func (s *MetNoService) buildLocationforecastCacheName(lat float64, lon float64, alt int) string {
+	return fmt.Sprintf("locationforecast-%.4f-%.4f-%d", lat, lon, alt)
 }
 
 ////////////////////////////////////////////////////////////
@@ -123,79 +84,63 @@ func isExpired(checkDate time.Time) bool {
 	return time.Now().After(checkDate)
 }
 
-// Loads and prepares the data from disk-cache.
-func prepareDataFromCache[T interface{}](service *MetNoService, memCacheObject *T, memCacheInfoObject cacheInfo, cacheName string, setMemCacheFunc func(*T, cacheInfo)) (*T, error) {
-	// Check the memory cache and if it is not expired, return it directly
-	if memCacheObject != nil && !isExpired(memCacheInfoObject.Expires) {
-		service.logger.Debug("Use memory cache as it is not expired")
-		return memCacheObject, nil
+func getDataFromCaches[T any](service *MetNoService, caches []Cache[T], cacheName string) (*T, cacheInfo, error) {
+	// Prepare variables to store the newest result from any of the caches
+	var newestObj *T
+	var newestInfo cacheInfo
+	var newestIndex int
+	// Prepare a map with the last modified date for each processed cache
+	cacheLastModified := map[int]time.Time{}
+	// Loop thru the caches
+	for i, cache := range caches {
+		// Try get the objects from this cache
+		obj, info, err := cache.GetCache(cacheName)
+		if err != nil {
+			return nil, cacheInfo{}, err
+		}
+		if obj == nil {
+			// Object not cached, continue with next cache
+			service.logger.Debug(fmt.Sprintf("No data in cache %d", i))
+			continue
+		}
+
+		// Store the data if it is the newest of all caches (or the first that has data)
+		if newestObj == nil || newestInfo.LastModified.Before(info.LastModified) {
+			newestObj = obj
+			newestInfo = info
+			newestIndex = i
+		}
+
+		// If the object is not expired, stop processing caches
+		if !isExpired(info.Expires) {
+			service.logger.Debug(fmt.Sprintf("Data in cache %d is not expired, using it", i))
+			break
+		}
+		service.logger.Debug(fmt.Sprintf("Data in cache %d is expired, trying next cache", i))
+
+		// Store the last modified date of this cache
+		cacheLastModified[i] = info.LastModified
 	}
 
-	// Load data from disk cache
-	cacheFileName, cacheInfoFileName := getCacheFileNames(cacheName)
-	diskCacheObject, diskCacheInfoObject, err := loadDataFromCache[T](service.cacheDir, cacheFileName, cacheInfoFileName)
-	if err != nil {
-		return nil, err
-	}
-	// No disk cache, fast return
-	if diskCacheObject == nil {
-		service.logger.Debug("No data in disk cache")
-		return nil, nil
-	}
-
-	// if the disk cache is newer than the memory cache or the memory cache is empty, update the memory cache with it
-	if memCacheObject == nil || diskCacheInfoObject.LastModified.After(memCacheInfoObject.LastModified) {
-		service.logger.Debug("Updated memory cache with disk cache")
-		setMemCacheFunc(diskCacheObject, diskCacheInfoObject)
-	}
-
-	// Check the disk cache and if it is not expired, return it directly
-	if !isExpired(diskCacheInfoObject.Expires) {
-		service.logger.Debug("Use disk cache as it is not expired")
-		return diskCacheObject, nil
-	}
-
-	// All caches are not set or expired
-	service.logger.Debug("Caches are not set or expired")
-	return nil, nil
-}
-
-func getCacheFileNames(cacheName string) (string, string) {
-	cacheFileName := fmt.Sprintf("metno-%s.json", cacheName)
-	cacheInfoFileName := fmt.Sprintf("metno-%s-info.json", cacheName)
-	return cacheFileName, cacheInfoFileName
-}
-
-func loadDataFromCache[T interface{}](cacheDir, cacheFileName, cacheInfoFileName string) (*T, cacheInfo, error) {
-	// No cache dir defined, so don't use the cache at all
-	if cacheDir == "" {
-		return nil, cacheInfo{}, nil
-	}
-	// Make sure the cache folder exists
-	if err := os.MkdirAll(cacheDir, os.ModePerm); err != nil {
-		return nil, cacheInfo{}, err
-	}
-
-	// Try getting the data file
-	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
-	cacheDataObject, err := readJsonFromFile[T](cacheFilePath, false)
-	if err != nil {
-		return nil, cacheInfo{}, err
-	} else if cacheDataObject == nil {
+	// No data in all caches found
+	if newestObj == nil {
+		service.logger.Debug("No data in all caches")
 		return nil, cacheInfo{}, nil
 	}
 
-	// Try getting the info file
-	cacheInfoFilePath := filepath.Join(cacheDir, cacheInfoFileName)
-	cacheInfoObject, err := readJsonFromFile[cacheInfo](cacheInfoFilePath, false)
-	if err != nil {
-		return nil, cacheInfo{}, err
-	} else if cacheInfoObject == nil {
-		return nil, cacheInfo{}, nil
+	// If the higher-rated caches had no or an older result, update it
+	for i := 0; i < newestIndex; i++ {
+		prevCacheModified, ok := cacheLastModified[i]
+		if !ok || prevCacheModified.Before(newestInfo.LastModified) {
+			service.logger.Debug(fmt.Sprintf("Update data in cache %d from cache %d", i, newestIndex))
+			if err := caches[i].SetCache(cacheName, newestObj, newestInfo); err != nil {
+				return nil, cacheInfo{}, nil
+			}
+		}
 	}
 
-	// Return the values
-	return cacheDataObject, *cacheInfoObject, nil
+	// Return the data
+	return newestObj, newestInfo, nil
 }
 
 func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCachedData *T, lastCacheInfo cacheInfo) (*T, cacheInfo, error) {
@@ -206,7 +151,7 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 		return nil, cacheInfo{}, err
 	}
 	req.Header.Set("User-Agent", service.siteName)
-	// Add last modified if we hve the info and cached data
+	// Add last modified if we have the info and cached data
 	if !lastCacheInfo.LastModified.IsZero() && lastCachedData != nil {
 		gmtTimeLoc := time.FixedZone("GMT", 0)
 		ifModifiedDate := lastCacheInfo.LastModified.In(gmtTimeLoc).Format(time.RFC1123)
@@ -241,9 +186,9 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 
 	// Check if the response was 304 - Not Modified
 	if resp.StatusCode == 304 {
-		service.logger.Debug("data from api not modified")
+		service.logger.Debug("Data from api not modified")
 		// Return the last data but update the cache info
-		return lastCachedData, cacheInfo{Expires: expiresDate.Local(), LastModified: lastModifiedDate.Local()}, nil
+		return lastCachedData, cacheInfo{Expires: expiresDate, LastModified: lastModifiedDate}, nil
 	}
 
 	// Check if the status code is a success code
@@ -255,30 +200,9 @@ func loadDataFromApi[T interface{}](service *MetNoService, url string, lastCache
 		}
 
 		// Return the values
-		return &dataObject, cacheInfo{Expires: expiresDate.Local(), LastModified: lastModifiedDate.Local()}, nil
+		return &dataObject, cacheInfo{Expires: expiresDate, LastModified: lastModifiedDate}, nil
 	}
 
 	// Failed status code
 	return nil, cacheInfo{}, fmt.Errorf("failed getting new data from the api with code: %d", resp.StatusCode)
-}
-
-func readJsonFromFile[T interface{}](filePath string, errorOnNotFound bool) (*T, error) {
-	fileDescriptor, err := os.Open(filePath)
-	if errors.Is(err, os.ErrNotExist) {
-		// File not found
-		if errorOnNotFound {
-			return nil, fmt.Errorf("file '%s' not found: %w", filePath, err)
-		}
-		return nil, nil
-	} else if err != nil {
-		// Error while reading the file
-		return nil, fmt.Errorf("error reading the file '%s': %w", filePath, err)
-	}
-	// Read the file
-	defer fileDescriptor.Close()
-	var dataObject T
-	if err := json.NewDecoder(fileDescriptor).Decode(&dataObject); err != nil {
-		return nil, fmt.Errorf("error converting the file '%s' to json: %w", filePath, err)
-	}
-	return &dataObject, nil
 }
